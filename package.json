@@ -1,0 +1,13 @@
+{
+  "name": "random-pic-api",
+  "version": "1.0.0",
+  "description": "随机图片 API 服务器",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
