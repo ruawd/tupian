@@ -1,7 +1,30 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
-const sizeOf = require('image-size');
+const { imageSize } = require('image-size');
+const multer = require('multer');
+
+// 配置 multer 存储
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, path.join(__dirname, 'ri', 'inbox')),
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname);
+        const name = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '');
+        cb(null, `${name}_${Date.now()}${ext}`);
+    }
+});
+const upload = multer({
+    storage,
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (['.webp', '.avif', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg'].includes(ext)) {
+            cb(null, true);
+        } else {
+            cb(new Error('不支持的图片格式'));
+        }
+    },
+    limits: { fileSize: 50 * 1024 * 1024 } // 50MB 限制
+});
 
 const app = express();
 const PORT = process.env.PORT || 3122;
@@ -60,8 +83,9 @@ function classifyImage(filename) {
         // 检查文件是否存在
         if (!fs.existsSync(srcPath)) return;
 
-        // 获取图片尺寸
-        const dimensions = sizeOf(srcPath);
+        // 获取图片尺寸 (image-size v2 需要传入 buffer)
+        const buffer = fs.readFileSync(srcPath);
+        const dimensions = imageSize(buffer);
         const { width, height } = dimensions;
 
         // 判断横屏还是竖屏
@@ -171,6 +195,39 @@ app.get('/classify', (req, res) => {
     });
 });
 
+// 图片列表 API (画廊页面使用，支持分页)
+app.get('/api/images', (req, res) => {
+    const type = req.query.type || 'all';
+    const page = parseInt(req.query.page) || 1;
+    const pageSize = parseInt(req.query.pageSize) || 20;
+    res.set('Access-Control-Allow-Origin', '*');
+
+    let images = [];
+    if (type === 'h' || type === 'all') {
+        images = images.concat(horizontalImages.map(f => ({ url: `/ri/h/${f}`, type: 'h' })));
+    }
+    if (type === 'v' || type === 'all') {
+        images = images.concat(verticalImages.map(f => ({ url: `/ri/v/${f}`, type: 'v' })));
+    }
+
+    const total = images.length;
+    const totalPages = Math.ceil(total / pageSize);
+    const start = (page - 1) * pageSize;
+    const end = start + pageSize;
+    const paginatedImages = images.slice(start, end);
+
+    res.json({
+        total,
+        horizontal: horizontalImages.length,
+        vertical: verticalImages.length,
+        page,
+        pageSize,
+        totalPages,
+        hasMore: page < totalPages,
+        images: paginatedImages
+    });
+});
+
 // 随机图片 API
 app.get('/pic', (req, res) => {
     try {
@@ -201,36 +258,85 @@ app.get('/pic', (req, res) => {
             return res.redirect(302, imageUrl);
         }
 
-        // 使用说明
-        res.set('Content-Type', 'text/plain; charset=utf-8');
-        res.send(`🖼️ 随机图片 API
-
-使用方法:
-• ?img=h  - 横屏随机图片
-• ?img=v  - 竖屏随机图片
-• ?img=ua - 根据设备自动选择
-
-其他 API:
-• /refresh  - 刷新图片列表
-• /classify - 手动触发分类
-
-自动分类:
-📥 把图片放到 ri/inbox 目录，会自动分类到 h 或 v
-
-支持格式: ${SUPPORTED_FORMATS.join(', ')}
-
-当前图片:
-• 横屏: ${horizontalImages.length} 张
-• 竖屏: ${verticalImages.length} 张`);
+        // 使用说明页面
+        res.sendFile(path.join(__dirname, 'api.html'));
 
     } catch (error) {
         res.status(500).send(`❌ 错误: ${error.message}`);
     }
 });
 
-// 首页
+// 上传图片 API
+app.post('/api/upload', upload.array('images', 20), (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ success: false, message: '没有上传文件' });
+    }
+    const uploaded = req.files.map(f => f.filename);
+    // 延迟一下让文件系统稳定，然后触发分类
+    setTimeout(() => {
+        req.files.forEach(f => classifyImage(f.filename));
+    }, 500);
+    res.json({ success: true, message: `成功上传 ${uploaded.length} 张图片`, files: uploaded });
+});
+
+// 删除图片 API
+app.delete('/api/delete', express.json(), (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'DELETE, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    const { url } = req.body;
+    if (!url) {
+        return res.status(400).json({ success: false, message: '缺少图片URL参数' });
+    }
+
+    try {
+        // 从URL中提取文件路径，如 /ri/h/xxx.jpg
+        const urlPath = url.replace(/^\//, ''); // 移除开头的 /
+        const filePath = path.join(__dirname, urlPath);
+
+        // 安全检查：确保文件在 ri 目录下
+        const riPath = path.join(__dirname, 'ri');
+        if (!filePath.startsWith(riPath)) {
+            return res.status(403).json({ success: false, message: '无权删除该文件' });
+        }
+
+        // 检查文件是否存在
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ success: false, message: '文件不存在' });
+        }
+
+        // 删除文件
+        fs.unlinkSync(filePath);
+
+        // 刷新图片列表
+        initImageLists();
+
+        console.log(`🗑️ 已删除: ${url}`);
+        res.json({ success: true, message: '图片已删除' });
+    } catch (error) {
+        console.error('❌ 删除失败:', error.message);
+        res.status(500).json({ success: false, message: '删除失败: ' + error.message });
+    }
+});
+
+// 处理 OPTIONS 请求 (CORS 预检)
+app.options('/api/delete', (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'DELETE, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    res.sendStatus(204);
+});
+
+// 首页 - 直接显示画廊
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
+    res.sendFile(path.join(__dirname, 'gallery.html'));
+});
+
+// 兼容旧的 /gallery 路径
+app.get('/gallery', (req, res) => {
+    res.redirect('/');
 });
 
 // 启动
