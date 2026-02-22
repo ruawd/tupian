@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
@@ -29,6 +30,21 @@ const upload = multer({
 
 const app = express();
 const PORT = process.env.PORT || 3122;
+
+// 管理密码（仅从环境变量读取，不硬编码）
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+
+// 密码验证中间件
+function requireAuth(req, res, next) {
+    if (!ADMIN_PASSWORD) {
+        return res.status(403).json({ success: false, message: '服务端未配置管理密码' });
+    }
+    const password = req.headers['x-admin-password'];
+    if (!password || password !== ADMIN_PASSWORD) {
+        return res.status(403).json({ success: false, message: '密码错误或未提供' });
+    }
+    next();
+}
 
 // 支持的图片格式
 const SUPPORTED_FORMATS = ['.webp', '.avif', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg'];
@@ -321,7 +337,7 @@ app.get('/pic', (req, res) => {
 });
 
 // 上传图片 API
-app.post('/api/upload', upload.array('images', 20), (req, res) => {
+app.post('/api/upload', requireAuth, upload.array('images', 20), (req, res) => {
     res.set('Access-Control-Allow-Origin', '*');
     if (!req.files || req.files.length === 0) {
         return res.status(400).json({ success: false, message: '没有上传文件' });
@@ -335,10 +351,10 @@ app.post('/api/upload', upload.array('images', 20), (req, res) => {
 });
 
 // 删除图片 API
-app.delete('/api/delete', express.json(), (req, res) => {
+app.delete('/api/delete', requireAuth, express.json(), (req, res) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Methods', 'DELETE, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, x-admin-password');
 
     const { url } = req.body;
     if (!url) {
@@ -379,7 +395,14 @@ app.delete('/api/delete', express.json(), (req, res) => {
 app.options('/api/delete', (req, res) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Methods', 'DELETE, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, x-admin-password');
+    res.sendStatus(204);
+});
+
+app.options('/api/upload', (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, x-admin-password');
     res.sendStatus(204);
 });
 
