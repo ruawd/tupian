@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const { imageSize } = require('image-size');
 const multer = require('multer');
+const sharp = require('sharp');
 
 // 配置 multer 存储
 const storage = multer.diskStorage({
@@ -41,10 +42,13 @@ const RI_PATH = path.join(__dirname, 'ri');
 const H_PATH = path.join(RI_PATH, 'h');
 const V_PATH = path.join(RI_PATH, 'v');
 const INBOX_PATH = path.join(RI_PATH, 'inbox');
+const THUMB_PATH = path.join(RI_PATH, 'thumb');
+const THUMB_H_PATH = path.join(THUMB_PATH, 'h');
+const THUMB_V_PATH = path.join(THUMB_PATH, 'v');
 
 // 确保目录存在
 function ensureDirectories() {
-    [RI_PATH, H_PATH, V_PATH, INBOX_PATH].forEach(dir => {
+    [RI_PATH, H_PATH, V_PATH, INBOX_PATH, THUMB_PATH, THUMB_H_PATH, THUMB_V_PATH].forEach(dir => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -177,6 +181,56 @@ function getRandomImage(imageList, type) {
 // 静态文件服务
 app.use('/ri', express.static(RI_PATH));
 
+// 缩略图服务 (动态生成并缓存)
+app.get('/thumb', async (req, res) => {
+    try {
+        const srcUrl = req.query.src;
+        if (!srcUrl || !srcUrl.startsWith('/ri/')) {
+            return res.status(400).send('❌ 参数错误');
+        }
+
+        // 解析原始文件路径
+        // srcUrl 格式如: /ri/h/image.jpg
+        const parts = srcUrl.split('/');
+        if (parts.length < 4) return res.status(400).send('❌ 路径无效');
+
+        const type = parts[2]; // 'h' 或 'v'
+        const filename = parts.slice(3).join('/'); // 'image.jpg'
+
+        if (type !== 'h' && type !== 'v') return res.status(400).send('❌ 类型无效');
+
+        const originalPath = path.join(type === 'h' ? H_PATH : V_PATH, filename);
+        if (!fs.existsSync(originalPath)) {
+            return res.status(404).send('❌ 原图不存在');
+        }
+
+        // 构建缩略图路径并强制转为 webp 以减小体积
+        const thumbFilename = path.basename(filename, path.extname(filename)) + '.webp';
+        const thumbDir = type === 'h' ? THUMB_H_PATH : THUMB_V_PATH;
+        const thumbPath = path.join(thumbDir, thumbFilename);
+
+        // 如果缩略图已存在，直接返回
+        if (fs.existsSync(thumbPath)) {
+            res.set('Content-Type', 'image/webp');
+            return res.sendFile(thumbPath);
+        }
+
+        // 生成缩略图
+        console.log(`🖼️ [Thumb] 生成缩略图: ${filename}`);
+        await sharp(originalPath)
+            .resize({ width: 400, withoutEnlargement: true }) // 高度自适应，最高宽度 400px
+            .webp({ quality: 80 }) // 压缩为 80% 画质的 WebP
+            .toFile(thumbPath);
+
+        res.set('Content-Type', 'image/webp');
+        res.sendFile(thumbPath);
+
+    } catch (e) {
+        console.error('❌ 生成缩略图失败:', e.message);
+        res.status(500).send('生成缩略图失败');
+    }
+});
+
 // 手动刷新
 app.get('/refresh', (req, res) => {
     initImageLists();
@@ -199,7 +253,7 @@ app.get('/classify', (req, res) => {
 app.get('/api/images', (req, res) => {
     const type = req.query.type || 'all';
     const page = parseInt(req.query.page) || 1;
-    const pageSize = parseInt(req.query.pageSize) || 20;
+    const pageSize = parseInt(req.query.pageSize) || 12; // 默认 12 张
     res.set('Access-Control-Allow-Origin', '*');
 
     let images = [];

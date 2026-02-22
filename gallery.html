@@ -892,7 +892,7 @@
         let currentUrl = '';
         let currentPage = 1;
         let totalPages = 1;
-        let pageSize = 21;
+        let pageSize = 12;
         let totalImages = 0;
 
         // 收藏功能
@@ -998,7 +998,7 @@
 
             grid.innerHTML = images.map(img => `
         <div class="ic" data-src="${img.url}">
-            <img src="${img.url}" loading="lazy" onload="this.classList.add('loaded')">
+            <img src="/thumb?src=${encodeURIComponent(img.url)}" loading="lazy" onload="this.classList.add('loaded')">
             <div class="fb${isFav(img.url) ? ' active' : ''}" title="收藏"></div>
         </div>
     `).join('');
