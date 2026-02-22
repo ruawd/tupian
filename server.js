@@ -95,8 +95,8 @@ function initImageLists() {
     console.log(`📁 横屏图片: ${horizontalImages.length} 张 | 竖屏图片: ${verticalImages.length} 张`);
 }
 
-// 自动分类单个图片
-function classifyImage(filename) {
+// 自动分类并压缩单个图片（转 WebP，最大 500KB）
+async function classifyImage(filename) {
     const srcPath = path.join(INBOX_PATH, filename);
 
     try {
@@ -111,21 +111,53 @@ function classifyImage(filename) {
         // 判断横屏还是竖屏
         const isHorizontal = width >= height;
         const destDir = isHorizontal ? H_PATH : V_PATH;
-        const destPath = path.join(destDir, filename);
+
+        // 输出文件名统一改为 .webp
+        const baseName = path.basename(filename, path.extname(filename));
+        let destFilename = `${baseName}.webp`;
+        let finalPath = path.join(destDir, destFilename);
 
         // 如果目标文件已存在，添加时间戳
-        let finalPath = destPath;
-        if (fs.existsSync(destPath)) {
-            const ext = path.extname(filename);
-            const name = path.basename(filename, ext);
-            finalPath = path.join(destDir, `${name}_${Date.now()}${ext}`);
+        if (fs.existsSync(finalPath)) {
+            destFilename = `${baseName}_${Date.now()}.webp`;
+            finalPath = path.join(destDir, destFilename);
         }
 
-        // 移动文件
-        fs.renameSync(srcPath, finalPath);
+        // 压缩转 WebP，最大 500KB
+        const MAX_SIZE = 500 * 1024; // 500KB
+        let quality = 85;
+        let outputBuffer;
+
+        // 逐步降低画质直到文件小于 500KB
+        while (quality >= 20) {
+            outputBuffer = await sharp(buffer)
+                .webp({ quality })
+                .toBuffer();
+
+            if (outputBuffer.length <= MAX_SIZE) break;
+            quality -= 10;
+        }
+
+        // 如果还是太大，缩小分辨率
+        if (outputBuffer.length > MAX_SIZE) {
+            const scale = Math.sqrt(MAX_SIZE / outputBuffer.length);
+            const newWidth = Math.round(width * scale);
+            outputBuffer = await sharp(buffer)
+                .resize({ width: newWidth, withoutEnlargement: true })
+                .webp({ quality: 30 })
+                .toBuffer();
+        }
+
+        // 写入目标文件
+        fs.writeFileSync(finalPath, outputBuffer);
+
+        // 删除原文件
+        fs.unlinkSync(srcPath);
 
         const type = isHorizontal ? '横屏' : '竖屏';
-        console.log(`✅ 已分类: ${filename} → ${type} (${width}x${height})`);
+        const originalSize = (buffer.length / 1024).toFixed(0);
+        const newSize = (outputBuffer.length / 1024).toFixed(0);
+        console.log(`✅ 已分类: ${filename} → ${type} (${width}x${height}) | ${originalSize}KB → ${newSize}KB WebP (q${quality})`);
 
         // 刷新图片列表
         initImageLists();
@@ -136,13 +168,15 @@ function classifyImage(filename) {
 }
 
 // 处理 inbox 目录中的所有图片
-function processInbox() {
+async function processInbox() {
     const files = scanImageDirectory(INBOX_PATH);
 
     if (files.length === 0) return;
 
     console.log(`\n📥 发现 ${files.length} 张待分类图片...`);
-    files.forEach(file => classifyImage(file));
+    for (const file of files) {
+        await classifyImage(file);
+    }
 }
 
 // 监听目录变化
@@ -343,9 +377,11 @@ app.post('/api/upload', requireAuth, upload.array('images', 20), (req, res) => {
         return res.status(400).json({ success: false, message: '没有上传文件' });
     }
     const uploaded = req.files.map(f => f.filename);
-    // 延迟一下让文件系统稳定，然后触发分类
-    setTimeout(() => {
-        req.files.forEach(f => classifyImage(f.filename));
+    // 延迟一下让文件系统稳定，然后触发分类压缩
+    setTimeout(async () => {
+        for (const f of req.files) {
+            await classifyImage(f.filename);
+        }
     }, 500);
     res.json({ success: true, message: `成功上传 ${uploaded.length} 张图片`, files: uploaded });
 });
