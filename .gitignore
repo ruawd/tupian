@@ -3,3 +3,5 @@ node_modules/
 *.log
 .env
 .tmp_gallery_check.js
+ri/.hash-index.json
+ri/.hash-index.json.tmp

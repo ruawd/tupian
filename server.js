@@ -30,6 +30,7 @@ const INBOX_PATH = path.join(RI_PATH, 'inbox');
 const THUMB_PATH = path.join(RI_PATH, 'thumb');
 const THUMB_H_PATH = path.join(THUMB_PATH, 'h');
 const THUMB_V_PATH = path.join(THUMB_PATH, 'v');
+const HASH_INDEX_PATH = path.join(RI_PATH, '.hash-index.json');
 
 // 缩略图生成去重缓存
 const thumbInFlight = new Map();
@@ -38,9 +39,12 @@ const thumbInFlight = new Map();
 const manageRouteCooldown = new Map();
 
 // 图片内容哈希索引（用于上传去重）
-let imageHashIndex = new Map();
+let imageHashIndex = new Map(); // hash -> relative path
+let imagePathHashIndex = new Map(); // relative path -> hash
 let imageHashIndexReady = false;
+let imageHashIndexSyncNeeded = true;
 let imageHashIndexBuilding = null;
+let hashIndexPersistTimer = null;
 
 // 配置 multer 存储
 const storage = multer.diskStorage({
@@ -118,45 +122,210 @@ function parseBoundedInt(value, fallback, min, max) {
     return Math.min(max, Math.max(min, parsed));
 }
 
+const CLASSIFY_CONCURRENCY = parseBoundedInt(process.env.CLASSIFY_CONCURRENCY, 3, 1, 8);
+
 function hashBufferSHA256(buffer) {
     return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
 function markImageHashIndexDirty() {
-    imageHashIndexReady = false;
-    imageHashIndex.clear();
+    imageHashIndexSyncNeeded = true;
+}
+
+function normalizeRelativeImagePath(relativePath) {
+    const normalized = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    return /^(h|v)\/.+/.test(normalized) ? normalized : '';
+}
+
+function resolveRelativeImagePath(relativePath) {
+    const normalized = normalizeRelativeImagePath(relativePath);
+    if (!normalized) return null;
+
+    const slashAt = normalized.indexOf('/');
+    const type = normalized.slice(0, slashAt);
+    const subPath = normalized.slice(slashAt + 1);
+    const baseDir = type === 'h' ? H_PATH : V_PATH;
+    const absolutePath = path.resolve(baseDir, subPath);
+    if (!absolutePath.startsWith(baseDir + path.sep)) {
+        return null;
+    }
+    return absolutePath;
+}
+
+function toRelativeImagePath(filePath) {
+    const absolutePath = path.resolve(filePath);
+    if (absolutePath.startsWith(H_PATH + path.sep)) {
+        return `h/${path.relative(H_PATH, absolutePath).split(path.sep).join('/')}`;
+    }
+    if (absolutePath.startsWith(V_PATH + path.sep)) {
+        return `v/${path.relative(V_PATH, absolutePath).split(path.sep).join('/')}`;
+    }
+    return '';
+}
+
+function rebuildImageHashIndexFromPathMap() {
+    const nextHashMap = new Map();
+    for (const [relativePath, hash] of imagePathHashIndex.entries()) {
+        if (!nextHashMap.has(hash)) {
+            nextHashMap.set(hash, relativePath);
+        }
+    }
+    imageHashIndex = nextHashMap;
+}
+
+function setImageHashIndexEntry(relativePath, hash) {
+    const normalizedPath = normalizeRelativeImagePath(relativePath);
+    if (!normalizedPath || !hash) return;
+    imagePathHashIndex.set(normalizedPath, hash.toLowerCase());
+    rebuildImageHashIndexFromPathMap();
+}
+
+function removeImageHashIndexEntryByRelativePath(relativePath) {
+    const normalizedPath = normalizeRelativeImagePath(relativePath);
+    if (!normalizedPath) return;
+    if (imagePathHashIndex.delete(normalizedPath)) {
+        rebuildImageHashIndexFromPathMap();
+    }
+}
+
+function removeFileFromHashIndex(filePath) {
+    if (!imageHashIndexReady) return;
+    const relativePath = toRelativeImagePath(filePath);
+    if (!relativePath) return;
+    removeImageHashIndexEntryByRelativePath(relativePath);
+    schedulePersistImageHashIndex();
+}
+
+async function persistImageHashIndex() {
+    if (!imageHashIndexReady) return;
+    const entries = Array.from(imagePathHashIndex.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+    const payload = {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        entries
+    };
+    const tempPath = `${HASH_INDEX_PATH}.tmp`;
+    await fsp.writeFile(tempPath, JSON.stringify(payload));
+    await fsp.rename(tempPath, HASH_INDEX_PATH);
+}
+
+function schedulePersistImageHashIndex() {
+    if (!imageHashIndexReady) return;
+    if (hashIndexPersistTimer) {
+        clearTimeout(hashIndexPersistTimer);
+    }
+    const timer = setTimeout(() => {
+        hashIndexPersistTimer = null;
+        persistImageHashIndex().catch(error => {
+            console.error('❌ 保存去重索引失败:', error.message);
+        });
+    }, 500);
+    hashIndexPersistTimer = timer;
+    timer.unref?.();
+}
+
+async function loadImageHashIndexFromDisk() {
+    if (!(await fileExists(HASH_INDEX_PATH))) return false;
+
+    try {
+        const raw = await fsp.readFile(HASH_INDEX_PATH, 'utf8');
+        const parsed = JSON.parse(raw);
+        const entries = Array.isArray(parsed?.entries) ? parsed.entries : null;
+        if (!entries) return false;
+
+        const nextPathMap = new Map();
+        for (const item of entries) {
+            if (!Array.isArray(item) || item.length !== 2) continue;
+            const [relativePathRaw, hashRaw] = item;
+            const relativePath = normalizeRelativeImagePath(relativePathRaw);
+            const hash = String(hashRaw || '').toLowerCase();
+            if (!relativePath) continue;
+            if (!/^[a-f0-9]{64}$/.test(hash)) continue;
+            if (!resolveRelativeImagePath(relativePath)) continue;
+            nextPathMap.set(relativePath, hash);
+        }
+
+        imagePathHashIndex = nextPathMap;
+        rebuildImageHashIndexFromPathMap();
+        imageHashIndexReady = true;
+        imageHashIndexSyncNeeded = true; // 启动后做一次轻量同步，修正外部变更
+        return true;
+    } catch (error) {
+        console.error('❌ 读取去重索引失败，将重建:', error.message);
+        return false;
+    }
 }
 
 async function buildImageHashIndex() {
-    const nextIndex = new Map();
-    for (const dir of [H_PATH, V_PATH]) {
+    const nextPathMap = new Map();
+    for (const [type, dir] of [['h', H_PATH], ['v', V_PATH]]) {
         const files = scanImageDirectory(dir);
         for (const filename of files) {
             const filePath = path.join(dir, filename);
             try {
                 const hash = hashBufferSHA256(await fsp.readFile(filePath));
-                if (!nextIndex.has(hash)) {
-                    nextIndex.set(hash, filePath);
-                }
+                const relativePath = `${type}/${filename}`;
+                nextPathMap.set(relativePath, hash);
             } catch (error) {
                 console.error(`❌ 读取图片哈希失败 ${filePath}:`, error.message);
             }
         }
     }
-    imageHashIndex = nextIndex;
+
+    imagePathHashIndex = nextPathMap;
+    rebuildImageHashIndexFromPathMap();
     imageHashIndexReady = true;
+    imageHashIndexSyncNeeded = false;
+    schedulePersistImageHashIndex();
 }
 
-async function ensureImageHashIndex() {
-    if (imageHashIndexReady) return;
+async function syncImageHashIndexWithFilesystem() {
+    const currentPaths = [];
+    for (const [type, dir] of [['h', H_PATH], ['v', V_PATH]]) {
+        const files = scanImageDirectory(dir);
+        for (const filename of files) {
+            currentPaths.push(`${type}/${filename}`);
+        }
+    }
+
+    const currentPathSet = new Set(currentPaths);
+    let changed = false;
+
+    for (const relativePath of Array.from(imagePathHashIndex.keys())) {
+        if (!currentPathSet.has(relativePath)) {
+            imagePathHashIndex.delete(relativePath);
+            changed = true;
+        }
+    }
+
+    for (const relativePath of currentPathSet) {
+        if (imagePathHashIndex.has(relativePath)) continue;
+        const absolutePath = resolveRelativeImagePath(relativePath);
+        if (!absolutePath) continue;
+        try {
+            const hash = hashBufferSHA256(await fsp.readFile(absolutePath));
+            imagePathHashIndex.set(relativePath, hash);
+            changed = true;
+        } catch (error) {
+            console.error(`❌ 增量同步哈希失败 ${absolutePath}:`, error.message);
+        }
+    }
+
+    if (changed) {
+        rebuildImageHashIndexFromPathMap();
+        schedulePersistImageHashIndex();
+    }
+
+    imageHashIndexSyncNeeded = false;
+}
+
+async function runHashIndexTask(task) {
     if (imageHashIndexBuilding) {
         await imageHashIndexBuilding;
-        return;
     }
     imageHashIndexBuilding = (async () => {
         try {
-            await buildImageHashIndex();
-            console.log(`🔐 去重索引已就绪: ${imageHashIndex.size} 条`);
+            await task();
         } finally {
             imageHashIndexBuilding = null;
         }
@@ -164,14 +333,74 @@ async function ensureImageHashIndex() {
     await imageHashIndexBuilding;
 }
 
-function removeFileFromHashIndex(filePath) {
-    if (!imageHashIndexReady) return;
-    for (const [hash, indexedPath] of imageHashIndex.entries()) {
-        if (indexedPath === filePath) {
-            imageHashIndex.delete(hash);
-            return;
+async function ensureImageHashIndex() {
+    if (!imageHashIndexReady) {
+        await runHashIndexTask(async () => {
+            if (imageHashIndexReady) return;
+            const loaded = await loadImageHashIndexFromDisk();
+            if (!loaded) {
+                await buildImageHashIndex();
+                console.log(`🔐 去重索引已重建: ${imageHashIndex.size} 条`);
+            } else {
+                console.log(`🔐 去重索引已加载: ${imageHashIndex.size} 条`);
+            }
+        });
+    }
+
+    if (imageHashIndexSyncNeeded) {
+        await runHashIndexTask(async () => {
+            if (!imageHashIndexSyncNeeded) return;
+            await syncImageHashIndexWithFilesystem();
+        });
+    }
+}
+
+async function findDuplicatePathByHash(hash) {
+    const duplicateRelativePath = imageHashIndex.get(hash);
+    if (!duplicateRelativePath) return '';
+
+    const duplicatePath = resolveRelativeImagePath(duplicateRelativePath);
+    if (duplicatePath && await fileExists(duplicatePath)) {
+        return duplicatePath;
+    }
+
+    // 索引有脏数据时懒清理
+    removeImageHashIndexEntryByRelativePath(duplicateRelativePath);
+    markImageHashIndexDirty();
+    schedulePersistImageHashIndex();
+    return '';
+}
+
+async function dedupeInboxFilesBySourceHash(filenames) {
+    const seenHashSet = new Set();
+    const uniqueFiles = [];
+    let duplicated = 0;
+
+    for (const name of filenames) {
+        const safeName = path.basename(String(name || ''));
+        if (!safeName) continue;
+
+        const srcPath = path.join(INBOX_PATH, safeName);
+        if (!(await fileExists(srcPath))) continue;
+
+        try {
+            const hash = hashBufferSHA256(await fsp.readFile(srcPath));
+            if (seenHashSet.has(hash)) {
+                await fsp.unlink(srcPath).catch(error => {
+                    if (error.code !== 'ENOENT') throw error;
+                });
+                duplicated += 1;
+                continue;
+            }
+            seenHashSet.add(hash);
+            uniqueFiles.push(safeName);
+        } catch (error) {
+            console.error(`❌ 上传批次去重失败 ${safeName}:`, error.message);
+            uniqueFiles.push(safeName);
         }
     }
+
+    return { files: uniqueFiles, duplicated };
 }
 
 async function fileExists(filePath) {
@@ -299,7 +528,7 @@ async function classifyImage(filename, options = {}) {
         // 去重：用压缩后内容计算哈希，与现有图库比对
         const outputHash = hashBufferSHA256(outputBuffer);
         await ensureImageHashIndex();
-        const duplicatePath = imageHashIndex.get(outputHash);
+        const duplicatePath = await findDuplicatePathByHash(outputHash);
         if (duplicatePath) {
             try {
                 await fsp.unlink(srcPath);
@@ -323,7 +552,9 @@ async function classifyImage(filename, options = {}) {
         // 写入目标文件
         await fsp.writeFile(finalPath, outputBuffer);
         if (imageHashIndexReady) {
-            imageHashIndex.set(outputHash, finalPath);
+            const relativePath = toRelativeImagePath(finalPath);
+            setImageHashIndexEntry(relativePath, outputHash);
+            schedulePersistImageHashIndex();
         }
 
         // 删除原文件
@@ -350,30 +581,58 @@ async function classifyImage(filename, options = {}) {
     }
 }
 
+async function classifyFilesBatch(files, options = {}) {
+    const fileList = Array.isArray(files) ? files.filter(Boolean) : [];
+    const concurrency = parseBoundedInt(options.concurrency, CLASSIFY_CONCURRENCY, 1, 8);
+    const refreshList = options.refreshList !== false;
+
+    const stats = {
+        total: fileList.length,
+        classified: 0,
+        duplicated: 0,
+        failed: 0,
+        skipped: 0
+    };
+
+    if (fileList.length === 0) {
+        return stats;
+    }
+
+    let cursor = 0;
+    const workerCount = Math.min(concurrency, fileList.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+        while (true) {
+            const idx = cursor;
+            cursor += 1;
+            if (idx >= fileList.length) break;
+
+            const result = await classifyImage(fileList[idx], { refreshList: false });
+            if (result === 'classified') stats.classified += 1;
+            else if (result === 'duplicate') stats.duplicated += 1;
+            else if (result === 'skipped') stats.skipped += 1;
+            else stats.failed += 1;
+        }
+    });
+
+    await Promise.all(workers);
+
+    if (refreshList && stats.classified > 0) {
+        initImageLists();
+    }
+
+    return stats;
+}
+
 // 处理 inbox 目录中的所有图片
 async function processInbox() {
     const files = scanImageDirectory(INBOX_PATH);
 
     if (files.length === 0) {
-        return { total: 0, classified: 0, duplicated: 0, failed: 0 };
+        return { total: 0, classified: 0, duplicated: 0, failed: 0, skipped: 0 };
     }
 
     console.log(`\n📥 发现 ${files.length} 张待分类图片...`);
-    let classified = 0;
-    let duplicated = 0;
-    let failed = 0;
-    for (const file of files) {
-        const result = await classifyImage(file, { refreshList: false });
-        if (result === 'classified') classified += 1;
-        else if (result === 'duplicate') duplicated += 1;
-        else if (result === 'failed') failed += 1;
-    }
-
-    if (classified > 0) {
-        initImageLists();
-    }
-
-    return { total: files.length, classified, duplicated, failed };
+    return classifyFilesBatch(files, { concurrency: CLASSIFY_CONCURRENCY, refreshList: true });
 }
 
 // 监听目录变化
@@ -435,17 +694,31 @@ function isMobileDevice(userAgent) {
     return mobileKeywords.some(k => lowerUA.includes(k.toLowerCase())) || /android|iphone|ipad|ipod/i.test(userAgent);
 }
 
-// 获取随机图片
-function getRandomImage(imageList, type) {
+function buildImageResource(type, filename) {
+    const baseName = path.basename(filename, path.extname(filename));
+    return {
+        url: `/ri/${type}/${filename}`,
+        type,
+        thumbUrl: `/ri/thumb/${type}/${baseName}.webp`
+    };
+}
+
+// 获取随机图片信息
+function getRandomImageInfo(imageList, type) {
     if (imageList.length === 0) return null;
     const randomIndex = Math.floor(Math.random() * imageList.length);
-    return `/ri/${type}/${imageList[randomIndex]}`;
+    const filename = imageList[randomIndex];
+    return {
+        ...buildImageResource(type, filename),
+        filePath: path.join(type === 'h' ? H_PATH : V_PATH, filename)
+    };
 }
 
 // 静态文件服务
 app.use('/ri', express.static(RI_PATH, {
-    maxAge: '7d',
-    etag: true
+    maxAge: '30d',
+    etag: true,
+    immutable: true
 }));
 
 // 缩略图服务 (动态生成并缓存)
@@ -510,6 +783,7 @@ app.get('/classify', createCooldownMiddleware('classify', 1000), async (req, res
         added: { horizontal: after.h - before.h, vertical: after.v - before.v },
         processed: result.total,
         duplicated: result.duplicated,
+        skipped: result.skipped,
         failed: result.failed
     });
 });
@@ -528,10 +802,10 @@ app.get('/api/images', (req, res) => {
 
     if (type === 'h') {
         total = horizontalImages.length;
-        paginatedImages = horizontalImages.slice(start, end).map(f => ({ url: `/ri/h/${f}`, type: 'h' }));
+        paginatedImages = horizontalImages.slice(start, end).map(f => buildImageResource('h', f));
     } else if (type === 'v') {
         total = verticalImages.length;
-        paginatedImages = verticalImages.slice(start, end).map(f => ({ url: `/ri/v/${f}`, type: 'v' }));
+        paginatedImages = verticalImages.slice(start, end).map(f => buildImageResource('v', f));
     } else {
         const horizontalTotal = horizontalImages.length;
         const verticalTotal = verticalImages.length;
@@ -539,7 +813,7 @@ app.get('/api/images', (req, res) => {
 
         if (start < horizontalTotal) {
             const hSlice = horizontalImages.slice(start, Math.min(end, horizontalTotal))
-                .map(f => ({ url: `/ri/h/${f}`, type: 'h' }));
+                .map(f => buildImageResource('h', f));
             paginatedImages = paginatedImages.concat(hSlice);
         }
 
@@ -547,7 +821,7 @@ app.get('/api/images', (req, res) => {
             const vStart = Math.max(0, start - horizontalTotal);
             const vEnd = end - horizontalTotal;
             const vSlice = verticalImages.slice(vStart, vEnd)
-                .map(f => ({ url: `/ri/v/${f}`, type: 'v' }));
+                .map(f => buildImageResource('v', f));
             paginatedImages = paginatedImages.concat(vSlice);
         }
     }
@@ -571,29 +845,40 @@ app.get('/pic', (req, res) => {
     try {
         const imgType = req.query.img;
         res.set('Access-Control-Allow-Origin', '*');
+        const useRedirect = req.query.redirect === '1';
+
+        const sendRandomImage = (type, list, missingMessage) => {
+            const info = getRandomImageInfo(list, type);
+            if (!info) {
+                return res.status(404).send(missingMessage);
+            }
+            res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+            if (useRedirect) {
+                return res.redirect(302, info.url);
+            }
+            return res.sendFile(info.filePath);
+        };
 
         if (imgType === 'h') {
-            const imageUrl = getRandomImage(horizontalImages, 'h');
-            if (!imageUrl) return res.status(404).send('❌ 没有找到横屏图片');
-            res.set('Cache-Control', 'no-cache');
-            return res.redirect(302, imageUrl);
+            return sendRandomImage('h', horizontalImages, '❌ 没有找到横屏图片');
         }
 
         if (imgType === 'v') {
-            const imageUrl = getRandomImage(verticalImages, 'v');
-            if (!imageUrl) return res.status(404).send('❌ 没有找到竖屏图片');
-            res.set('Cache-Control', 'no-cache');
-            return res.redirect(302, imageUrl);
+            return sendRandomImage('v', verticalImages, '❌ 没有找到竖屏图片');
         }
 
         if (imgType === 'ua') {
             const isMobile = isMobileDevice(req.headers['user-agent'] || '');
-            const imageUrl = isMobile
-                ? getRandomImage(verticalImages, 'v')
-                : getRandomImage(horizontalImages, 'h');
-            if (!imageUrl) return res.status(404).send('❌ 没有找到图片');
-            res.set('Cache-Control', 'no-cache');
-            return res.redirect(302, imageUrl);
+            const primaryType = isMobile ? 'v' : 'h';
+            const secondaryType = isMobile ? 'h' : 'v';
+            const primaryList = isMobile ? verticalImages : horizontalImages;
+            const secondaryList = isMobile ? horizontalImages : verticalImages;
+
+            // 优先按设备方向选择，空库时降级到另一类，避免 404
+            if (primaryList.length > 0) {
+                return sendRandomImage(primaryType, primaryList, '❌ 没有找到图片');
+            }
+            return sendRandomImage(secondaryType, secondaryList, '❌ 没有找到图片');
         }
 
         // 使用说明页面
@@ -615,19 +900,14 @@ app.post('/api/upload', requireAuth, upload.array('images', 20), (req, res) => {
     // 延迟一下让文件系统稳定，然后触发分类压缩
     setTimeout(async () => {
         try {
-            let classified = 0;
-            let duplicated = 0;
-            for (const f of req.files) {
-                const result = await classifyImage(f.filename, { refreshList: false });
-                if (result === 'classified') classified += 1;
-                else if (result === 'duplicate') duplicated += 1;
-            }
-
-            if (classified > 0) {
-                initImageLists();
-            }
-            if (duplicated > 0) {
-                console.log(`⏭️ 上传去重完成: 跳过 ${duplicated} 张重复图片`);
+            const batchDedupe = await dedupeInboxFilesBySourceHash(uploaded);
+            const result = await classifyFilesBatch(batchDedupe.files, {
+                concurrency: CLASSIFY_CONCURRENCY,
+                refreshList: true
+            });
+            const duplicatedTotal = result.duplicated + batchDedupe.duplicated;
+            if (duplicatedTotal > 0) {
+                console.log(`⏭️ 上传去重完成: 跳过 ${duplicatedTotal} 张重复图片`);
             }
         } catch (error) {
             console.error('❌ 上传后自动分类失败:', error.message);
@@ -706,6 +986,9 @@ app.get('/gallery', (req, res) => {
 // 启动
 ensureDirectories();
 initImageLists();
+ensureImageHashIndex().catch(error => {
+    console.error('❌ 初始化去重索引失败:', error.message);
+});
 processInbox().catch(error => {
     console.error('❌ 启动分类失败:', error.message);
 }); // 启动时处理已有的待分类图片

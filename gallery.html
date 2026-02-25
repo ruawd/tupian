@@ -1026,6 +1026,17 @@
             window.scrollTo({ top: 0, behavior: 'smooth' });
         }
 
+        function toThumbUrl(url, providedThumbUrl) {
+            if (providedThumbUrl) return providedThumbUrl;
+            const match = String(url || '').match(/^\/ri\/(h|v)\/(.+)$/);
+            if (!match) return `/thumb?src=${encodeURIComponent(url || '')}`;
+            const type = match[1];
+            const filename = match[2].split('/').pop() || '';
+            const dotAt = filename.lastIndexOf('.');
+            const baseName = dotAt === -1 ? filename : filename.slice(0, dotAt);
+            return `/ri/thumb/${type}/${baseName}.webp`;
+        }
+
         // 渲染图片
         function renderImages() {
             let images = [];
@@ -1033,7 +1044,7 @@
 
             if (currentCat === 'favorites') {
                 const favs = getFavs();
-                images = favs.map(url => ({ url }));
+                images = favs.map(url => ({ url, thumbUrl: toThumbUrl(url) }));
                 titleText = '我的收藏';
             } else {
                 images = allImages;
@@ -1048,12 +1059,17 @@
                 return;
             }
 
-            grid.innerHTML = images.map(img => `
+            grid.innerHTML = images.map((img, idx) => {
+                const thumbUrl = toThumbUrl(img.url, img.thumbUrl);
+                const fallbackThumbUrl = `/thumb?src=${encodeURIComponent(img.url)}`;
+                const fetchPriority = idx < 4 ? 'high' : 'low';
+                return `
         <div class="ic" data-src="${img.url}">
-            <img src="/thumb?src=${encodeURIComponent(img.url)}" loading="lazy" onload="this.classList.add('loaded')">
+            <img src="${thumbUrl}" loading="lazy" decoding="async" fetchpriority="${fetchPriority}" onload="this.classList.add('loaded')" onerror="if(!this.dataset.fallback){this.dataset.fallback='1';this.src='${fallbackThumbUrl}';}">
             <div class="fb${isFav(img.url) ? ' active' : ''}" title="收藏"></div>
         </div>
-    `).join('');
+    `;
+            }).join('');
         }
 
         // 事件委托：点击图片/收藏
