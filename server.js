@@ -3,6 +3,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
+const crypto = require('crypto');
 const { imageSize } = require('image-size');
 const multer = require('multer');
 const sharp = require('sharp');
@@ -35,6 +36,11 @@ const thumbInFlight = new Map();
 
 // 高频管理接口限流
 const manageRouteCooldown = new Map();
+
+// 图片内容哈希索引（用于上传去重）
+let imageHashIndex = new Map();
+let imageHashIndexReady = false;
+let imageHashIndexBuilding = null;
 
 // 配置 multer 存储
 const storage = multer.diskStorage({
@@ -112,6 +118,62 @@ function parseBoundedInt(value, fallback, min, max) {
     return Math.min(max, Math.max(min, parsed));
 }
 
+function hashBufferSHA256(buffer) {
+    return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+function markImageHashIndexDirty() {
+    imageHashIndexReady = false;
+    imageHashIndex.clear();
+}
+
+async function buildImageHashIndex() {
+    const nextIndex = new Map();
+    for (const dir of [H_PATH, V_PATH]) {
+        const files = scanImageDirectory(dir);
+        for (const filename of files) {
+            const filePath = path.join(dir, filename);
+            try {
+                const hash = hashBufferSHA256(await fsp.readFile(filePath));
+                if (!nextIndex.has(hash)) {
+                    nextIndex.set(hash, filePath);
+                }
+            } catch (error) {
+                console.error(`❌ 读取图片哈希失败 ${filePath}:`, error.message);
+            }
+        }
+    }
+    imageHashIndex = nextIndex;
+    imageHashIndexReady = true;
+}
+
+async function ensureImageHashIndex() {
+    if (imageHashIndexReady) return;
+    if (imageHashIndexBuilding) {
+        await imageHashIndexBuilding;
+        return;
+    }
+    imageHashIndexBuilding = (async () => {
+        try {
+            await buildImageHashIndex();
+            console.log(`🔐 去重索引已就绪: ${imageHashIndex.size} 条`);
+        } finally {
+            imageHashIndexBuilding = null;
+        }
+    })();
+    await imageHashIndexBuilding;
+}
+
+function removeFileFromHashIndex(filePath) {
+    if (!imageHashIndexReady) return;
+    for (const [hash, indexedPath] of imageHashIndex.entries()) {
+        if (indexedPath === filePath) {
+            imageHashIndex.delete(hash);
+            return;
+        }
+    }
+}
+
 async function fileExists(filePath) {
     try {
         await fsp.access(filePath, fs.constants.F_OK);
@@ -186,13 +248,13 @@ function initImageLists() {
 async function classifyImage(filename, options = {}) {
     const { refreshList = true } = options;
     const safeFilename = path.basename(String(filename || ''));
-    if (!safeFilename) return false;
+    if (!safeFilename) return 'skipped';
 
     const srcPath = path.join(INBOX_PATH, safeFilename);
 
     try {
         // 检查文件是否存在
-        if (!(await fileExists(srcPath))) return false;
+        if (!(await fileExists(srcPath))) return 'skipped';
 
         // 获取图片尺寸 (image-size v2 需要传入 buffer)
         const buffer = await fsp.readFile(srcPath);
@@ -205,16 +267,6 @@ async function classifyImage(filename, options = {}) {
         // 判断横屏还是竖屏
         const isHorizontal = width >= height;
         const destDir = isHorizontal ? H_PATH : V_PATH;
-
-        // 输出文件名统一改为 .webp
-        const rawBaseName = path.basename(safeFilename, path.extname(safeFilename));
-        const baseName = rawBaseName || `img_${Date.now()}`;
-        let uniqueSuffix = 0;
-        let finalPath = path.join(destDir, `${baseName}.webp`);
-        while (await fileExists(finalPath)) {
-            uniqueSuffix += 1;
-            finalPath = path.join(destDir, `${baseName}_${Date.now()}_${uniqueSuffix}.webp`);
-        }
 
         // 压缩转 WebP，最大 500KB
         const MAX_SIZE = 500 * 1024; // 500KB
@@ -244,8 +296,35 @@ async function classifyImage(filename, options = {}) {
             usedQuality = 30;
         }
 
+        // 去重：用压缩后内容计算哈希，与现有图库比对
+        const outputHash = hashBufferSHA256(outputBuffer);
+        await ensureImageHashIndex();
+        const duplicatePath = imageHashIndex.get(outputHash);
+        if (duplicatePath) {
+            try {
+                await fsp.unlink(srcPath);
+            } catch (error) {
+                if (error.code !== 'ENOENT') throw error;
+            }
+            console.log(`⏭️ 已去重: ${safeFilename} 与 ${path.basename(duplicatePath)} 内容相同，已跳过`);
+            return 'duplicate';
+        }
+
+        // 输出文件名统一改为 .webp
+        const rawBaseName = path.basename(safeFilename, path.extname(safeFilename));
+        const baseName = rawBaseName || `img_${Date.now()}`;
+        let uniqueSuffix = 0;
+        let finalPath = path.join(destDir, `${baseName}.webp`);
+        while (await fileExists(finalPath)) {
+            uniqueSuffix += 1;
+            finalPath = path.join(destDir, `${baseName}_${Date.now()}_${uniqueSuffix}.webp`);
+        }
+
         // 写入目标文件
         await fsp.writeFile(finalPath, outputBuffer);
+        if (imageHashIndexReady) {
+            imageHashIndex.set(outputHash, finalPath);
+        }
 
         // 删除原文件
         try {
@@ -264,10 +343,10 @@ async function classifyImage(filename, options = {}) {
             initImageLists();
         }
 
-        return true;
+        return 'classified';
     } catch (error) {
         console.error(`❌ 分类失败 ${safeFilename}:`, error.message);
-        return false;
+        return 'failed';
     }
 }
 
@@ -276,23 +355,25 @@ async function processInbox() {
     const files = scanImageDirectory(INBOX_PATH);
 
     if (files.length === 0) {
-        return { total: 0, success: 0, failed: 0 };
+        return { total: 0, classified: 0, duplicated: 0, failed: 0 };
     }
 
     console.log(`\n📥 发现 ${files.length} 张待分类图片...`);
-    let success = 0;
+    let classified = 0;
+    let duplicated = 0;
     let failed = 0;
     for (const file of files) {
-        const ok = await classifyImage(file, { refreshList: false });
-        if (ok) success += 1;
-        else failed += 1;
+        const result = await classifyImage(file, { refreshList: false });
+        if (result === 'classified') classified += 1;
+        else if (result === 'duplicate') duplicated += 1;
+        else if (result === 'failed') failed += 1;
     }
 
-    if (success > 0) {
+    if (classified > 0) {
         initImageLists();
     }
 
-    return { total: files.length, success, failed };
+    return { total: files.length, classified, duplicated, failed };
 }
 
 // 监听目录变化
@@ -327,7 +408,10 @@ function watchDirectories() {
     let debounceTimer = null;
     const debounceRefresh = () => {
         if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(initImageLists, 1000);
+        debounceTimer = setTimeout(() => {
+            markImageHashIndexDirty();
+            initImageLists();
+        }, 1000);
     };
 
     [H_PATH, V_PATH].forEach(dir => {
@@ -409,6 +493,7 @@ app.get('/thumb', async (req, res) => {
 
 // 手动刷新
 app.get('/refresh', createCooldownMiddleware('refresh', 1000), (req, res) => {
+    markImageHashIndexDirty();
     initImageLists();
     res.json({ success: true, horizontal: horizontalImages.length, vertical: verticalImages.length });
 });
@@ -424,6 +509,7 @@ app.get('/classify', createCooldownMiddleware('classify', 1000), async (req, res
         message: '分类完成',
         added: { horizontal: after.h - before.h, vertical: after.v - before.v },
         processed: result.total,
+        duplicated: result.duplicated,
         failed: result.failed
     });
 });
@@ -529,20 +615,26 @@ app.post('/api/upload', requireAuth, upload.array('images', 20), (req, res) => {
     // 延迟一下让文件系统稳定，然后触发分类压缩
     setTimeout(async () => {
         try {
-            let changed = false;
+            let classified = 0;
+            let duplicated = 0;
             for (const f of req.files) {
-                const ok = await classifyImage(f.filename, { refreshList: false });
-                if (ok) changed = true;
+                const result = await classifyImage(f.filename, { refreshList: false });
+                if (result === 'classified') classified += 1;
+                else if (result === 'duplicate') duplicated += 1;
             }
-            if (changed) {
+
+            if (classified > 0) {
                 initImageLists();
+            }
+            if (duplicated > 0) {
+                console.log(`⏭️ 上传去重完成: 跳过 ${duplicated} 张重复图片`);
             }
         } catch (error) {
             console.error('❌ 上传后自动分类失败:', error.message);
         }
     }, 500).unref?.();
 
-    res.json({ success: true, message: `成功上传 ${uploaded.length} 张图片`, files: uploaded });
+    res.json({ success: true, message: `已接收 ${uploaded.length} 张图片，后台处理中`, files: uploaded });
 });
 
 // 删除图片 API
@@ -569,6 +661,7 @@ app.delete('/api/delete', requireAuth, express.json(), async (req, res) => {
 
         // 删除文件
         await fsp.unlink(resolved.filePath);
+        removeFileFromHashIndex(resolved.filePath);
         // 尝试删除对应缩略图，避免脏缓存
         await fsp.unlink(resolved.thumbPath).catch(error => {
             if (error.code !== 'ENOENT') throw error;
