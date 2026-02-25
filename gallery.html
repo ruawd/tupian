@@ -810,8 +810,9 @@
             <div class="header">
                 <h2 id="title">全部图片</h2>
                 <div class="header-btns">
+                    <button class="header-btn" id="passwordBtn">🔐 管理密码</button>
                     <button class="header-btn primary" id="uploadBtn">📤 上传图片</button>
-                    <button class="header-btn" onclick="location.reload()">🔄 刷新</button>
+                    <button class="header-btn" id="refreshBtn">🔄 刷新</button>
                 </div>
             </div>
             <div class="grid" id="grid">
@@ -887,6 +888,7 @@
         const tst = document.getElementById('tst');
         const title = document.getElementById('title');
         const pagination = document.getElementById('pagination');
+        const refreshBtn = document.getElementById('refreshBtn');
         let allImages = [];
         let currentCat = 'all';
         let currentUrl = '';
@@ -894,22 +896,71 @@
         let totalPages = 1;
         let pageSize = 12;
         let totalImages = 0;
+        let loadRequestId = 0;
 
         // 收藏功能
-        const getFavs = () => JSON.parse(localStorage.getItem('galleryFavs') || '[]');
-        const setFavs = f => localStorage.setItem('galleryFavs', JSON.stringify(f));
-        const isFav = url => getFavs().includes(url);
+        let favSetCache = null;
+
+        function getFavsSet() {
+            if (favSetCache) return favSetCache;
+            try {
+                const parsed = JSON.parse(localStorage.getItem('galleryFavs') || '[]');
+                favSetCache = new Set(Array.isArray(parsed) ? parsed : []);
+            } catch {
+                favSetCache = new Set();
+            }
+            return favSetCache;
+        }
+
+        function persistFavs() {
+            localStorage.setItem('galleryFavs', JSON.stringify(Array.from(getFavsSet())));
+        }
+
+        const getFavs = () => Array.from(getFavsSet());
+        const isFav = url => getFavsSet().has(url);
+        const getAdminPassword = () => localStorage.getItem('galleryAdminPassword') || '';
+        const setAdminPassword = value => localStorage.setItem('galleryAdminPassword', value);
+        const clearAdminPassword = () => localStorage.removeItem('galleryAdminPassword');
+
+        function ensureAdminPassword() {
+            let pwd = getAdminPassword();
+            if (!pwd) {
+                pwd = prompt('请输入管理密码（用于上传和删除）') || '';
+                pwd = pwd.trim();
+                if (!pwd) return '';
+                setAdminPassword(pwd);
+            }
+            return pwd;
+        }
 
         // 提示消息
         const msg = m => { tst.innerText = m; tst.className = 'show'; setTimeout(() => tst.className = '', 2000); };
 
+        refreshBtn.onclick = () => location.reload();
+
+        document.getElementById('passwordBtn').onclick = () => {
+            const current = getAdminPassword();
+            const value = prompt('请输入管理密码（留空清除）', current) ?? '';
+            const trimmed = value.trim();
+            if (!trimmed) {
+                clearAdminPassword();
+                msg('✅ 已清除管理密码');
+                return;
+            }
+            setAdminPassword(trimmed);
+            msg('✅ 管理密码已保存');
+        };
+
         // 加载图片列表（分页）
         async function loadImages(page = 1) {
+            const requestId = ++loadRequestId;
             try {
                 grid.innerHTML = '<div class="loading">⏳ 加载中...</div>';
                 const typeParam = currentCat === 'all' ? 'all' : currentCat === 'h' ? 'h' : currentCat === 'v' ? 'v' : 'all';
-                const res = await fetch(`/api/images?type=${typeParam}&page=${page}&pageSize=${pageSize}`);
+                const res = await fetch(`/api/images?type=${typeParam}&page=${page}&pageSize=${pageSize}`, { cache: 'no-store' });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
+                if (requestId !== loadRequestId) return;
 
                 allImages = data.images;
                 currentPage = data.page;
@@ -924,6 +975,7 @@
                 renderImages();
                 renderPagination();
             } catch (e) {
+                if (requestId !== loadRequestId) return;
                 grid.innerHTML = '<div class="et">❌ 加载失败，请刷新重试</div>';
                 pagination.innerHTML = '';
             }
@@ -931,7 +983,7 @@
 
         // 更新收藏数量
         function updateFavCount() {
-            document.getElementById('fav-cnt').textContent = getFavs().length;
+            document.getElementById('fav-cnt').textContent = getFavsSet().size;
         }
 
         // 渲染分页
@@ -1015,23 +1067,22 @@
             if (fb) {
                 // 点击收藏
                 e.stopPropagation();
-                let favs = getFavs();
-                const idx = favs.indexOf(url);
-                const isAdd = idx === -1;
+                const favs = getFavsSet();
+                const isAdd = !favs.has(url);
 
                 if (isAdd) {
-                    favs.push(url);
+                    favs.add(url);
                     fb.classList.add('active');
                 } else {
-                    favs.splice(idx, 1);
+                    favs.delete(url);
                     fb.classList.remove('active');
                     if (currentCat === 'favorites') {
                         card.style.cssText = 'transform:scale(0);opacity:0';
-                        setTimeout(() => { card.remove(); if (!getFavs().length) renderImages(); }, 300);
+                        setTimeout(() => { card.remove(); if (!favs.size) renderImages(); }, 300);
                     }
                 }
 
-                setFavs(favs);
+                persistFavs();
                 updateFavCount();
                 msg(isAdd ? '❤️ 已收藏' : '💔 已取消收藏');
             } else {
@@ -1117,10 +1168,19 @@
             deleteConfirm.classList.remove('active');
             msg('⏳ 正在删除...');
 
+            const password = ensureAdminPassword();
+            if (!password) {
+                msg('❌ 未提供管理密码');
+                return;
+            }
+
             try {
                 const res = await fetch('/api/delete', {
                     method: 'DELETE',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-admin-password': password
+                    },
                     body: JSON.stringify({ url: currentUrl })
                 });
                 const data = await res.json();
@@ -1130,11 +1190,9 @@
                     hideLb();
 
                     // 从收藏中移除
-                    let favs = getFavs();
-                    const favIdx = favs.indexOf(currentUrl);
-                    if (favIdx !== -1) {
-                        favs.splice(favIdx, 1);
-                        setFavs(favs);
+                    const favs = getFavsSet();
+                    if (favs.delete(currentUrl)) {
+                        persistFavs();
                         updateFavCount();
                     }
 
@@ -1177,10 +1235,18 @@
         uploadClose.onclick = () => { closeUploadModal(); };
         uploadModal.onclick = e => { if (e.target === uploadModal) closeUploadModal(); };
 
+        function clearUploadPreviewUrls() {
+            for (const item of filesToUpload) {
+                URL.revokeObjectURL(item.previewUrl);
+            }
+        }
+
         function closeUploadModal() {
             uploadModal.classList.remove('active');
+            clearUploadPreviewUrls();
             filesToUpload = [];
             uploadFiles.innerHTML = '';
+            fileInput.value = '';
             uploadSubmit.disabled = true;
             uploadProgress.classList.remove('active');
             progressFill.style.width = '0%';
@@ -1199,19 +1265,24 @@
         function addFiles(files) {
             for (const file of files) {
                 if (!file.type.startsWith('image/')) continue;
-                if (filesToUpload.some(f => f.name === file.name && f.size === file.size)) continue;
-                filesToUpload.push(file);
+                const key = `${file.name}__${file.size}__${file.lastModified}`;
+                if (filesToUpload.some(item => item.key === key)) continue;
+                filesToUpload.push({
+                    key,
+                    file,
+                    previewUrl: URL.createObjectURL(file)
+                });
             }
             renderUploadFiles();
         }
 
         function renderUploadFiles() {
-            uploadFiles.innerHTML = filesToUpload.map((file, i) => `
+            uploadFiles.innerHTML = filesToUpload.map((item, i) => `
                 <div class="upload-file">
-                    <img src="${URL.createObjectURL(file)}">
+                    <img src="${item.previewUrl}">
                     <div class="upload-file-info">
-                        <div class="upload-file-name">${file.name}</div>
-                        <div class="upload-file-size">${(file.size / 1024 / 1024).toFixed(2)} MB</div>
+                        <div class="upload-file-name">${item.file.name}</div>
+                        <div class="upload-file-size">${(item.file.size / 1024 / 1024).toFixed(2)} MB</div>
                     </div>
                     <button class="upload-file-remove" onclick="removeFile(${i})">&times;</button>
                 </div>
@@ -1220,18 +1291,26 @@
         }
 
         function removeFile(index) {
-            filesToUpload.splice(index, 1);
+            const removed = filesToUpload.splice(index, 1)[0];
+            if (removed) {
+                URL.revokeObjectURL(removed.previewUrl);
+            }
             renderUploadFiles();
         }
 
         uploadSubmit.onclick = async () => {
             if (filesToUpload.length === 0) return;
+            const password = ensureAdminPassword();
+            if (!password) {
+                msg('❌ 未提供管理密码');
+                return;
+            }
             uploadSubmit.disabled = true;
             uploadProgress.classList.add('active');
             progressText.textContent = '上传中...';
 
             const formData = new FormData();
-            filesToUpload.forEach(f => formData.append('images', f));
+            filesToUpload.forEach(item => formData.append('images', item.file));
 
             try {
                 const xhr = new XMLHttpRequest();
@@ -1255,6 +1334,7 @@
                 };
                 xhr.onerror = () => { msg('❌ 网络错误'); uploadSubmit.disabled = false; };
                 xhr.open('POST', '/api/upload');
+                xhr.setRequestHeader('x-admin-password', password);
                 xhr.send(formData);
             } catch (e) {
                 msg('❌ 上传失败');
@@ -1263,6 +1343,7 @@
         };
 
         // 初始化
+        updateFavCount();
         loadImages();
     </script>
 </body>
