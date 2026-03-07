@@ -10,6 +10,7 @@ const sharp = require('sharp');
 
 const app = express();
 const PORT = process.env.PORT || 3122;
+app.use(express.json({ limit: '1mb' }));
 
 // 管理密码（仅从环境变量读取，不硬编码）
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
@@ -21,6 +22,8 @@ const SUPPORTED_FORMAT_SET = new Set(SUPPORTED_FORMATS);
 // 图片缓存
 let horizontalImages = [];
 let verticalImages = [];
+let horizontalImageSet = new Set();
+let verticalImageSet = new Set();
 
 // 目录路径
 const RI_PATH = path.join(__dirname, 'ri');
@@ -37,6 +40,7 @@ const thumbInFlight = new Map();
 
 // 高频管理接口限流
 const manageRouteCooldown = new Map();
+const adminSessions = new Map();
 
 // 图片内容哈希索引（用于上传去重）
 let imageHashIndex = new Map(); // hash -> relative path
@@ -68,6 +72,73 @@ const upload = multer({
     limits: { fileSize: 50 * 1024 * 1024 } // 50MB 限制
 });
 
+function parseCookies(cookieHeader) {
+    const cookieSource = Array.isArray(cookieHeader) ? cookieHeader.join(';') : String(cookieHeader || '');
+    const cookies = Object.create(null);
+    for (const item of cookieSource.split(';')) {
+        const [rawName, ...rest] = item.trim().split('=');
+        if (!rawName) continue;
+        cookies[rawName] = decodeURIComponent(rest.join('=') || '');
+    }
+    return cookies;
+}
+
+function cleanupExpiredAdminSessions() {
+    const now = Date.now();
+    for (const [token, expiresAt] of adminSessions.entries()) {
+        if (expiresAt <= now) {
+            adminSessions.delete(token);
+        }
+    }
+}
+
+function buildAdminSessionCookie(token, maxAgeSeconds) {
+    const secureFlag = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+    return `admin_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secureFlag}`;
+}
+
+function setAdminSessionCookie(res, token, expiresAt) {
+    const maxAgeSeconds = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+    res.set('Set-Cookie', buildAdminSessionCookie(token, maxAgeSeconds));
+}
+
+function clearAdminSessionCookie(res) {
+    res.set('Set-Cookie', buildAdminSessionCookie('', 0));
+}
+
+function createAdminSession() {
+    cleanupExpiredAdminSessions();
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = Date.now() + ADMIN_SESSION_TTL_MS;
+    adminSessions.set(token, expiresAt);
+    return { token, expiresAt };
+}
+
+function getAdminSessionToken(req) {
+    const cookies = parseCookies(req.headers.cookie);
+    return cookies.admin_session || '';
+}
+
+function hasValidAdminSession(req) {
+    cleanupExpiredAdminSessions();
+    const token = getAdminSessionToken(req);
+    if (!token) return false;
+
+    const expiresAt = adminSessions.get(token);
+    if (!expiresAt || expiresAt <= Date.now()) {
+        adminSessions.delete(token);
+        return false;
+    }
+    return true;
+}
+
+function destroyAdminSession(req) {
+    const token = getAdminSessionToken(req);
+    if (token) {
+        adminSessions.delete(token);
+    }
+}
+
 app.use('/api', (req, res, next) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
@@ -83,8 +154,13 @@ function requireAuth(req, res, next) {
     if (!ADMIN_PASSWORD) {
         return res.status(403).json({ success: false, message: '服务端未配置管理密码' });
     }
-    const password = req.headers['x-admin-password'];
+    if (hasValidAdminSession(req)) {
+        return next();
+    }
+    const headerValue = req.headers['x-admin-password'];
+    const password = Array.isArray(headerValue) ? headerValue[0] : headerValue;
     if (!password || password !== ADMIN_PASSWORD) {
+        clearAdminSessionCookie(res);
         return res.status(403).json({ success: false, message: '密码错误或未提供' });
     }
     next();
@@ -123,6 +199,7 @@ function parseBoundedInt(value, fallback, min, max) {
 }
 
 const CLASSIFY_CONCURRENCY = parseBoundedInt(process.env.CLASSIFY_CONCURRENCY, 3, 1, 8);
+const ADMIN_SESSION_TTL_MS = parseBoundedInt(process.env.ADMIN_SESSION_TTL_HOURS, 12, 1, 24 * 30) * 60 * 60 * 1000;
 
 function hashBufferSHA256(buffer) {
     return crypto.createHash('sha256').update(buffer).digest('hex');
@@ -166,9 +243,12 @@ function toRelativeImagePath(filePath) {
 function rebuildImageHashIndexFromPathMap() {
     const nextHashMap = new Map();
     for (const [relativePath, hash] of imagePathHashIndex.entries()) {
-        if (!nextHashMap.has(hash)) {
-            nextHashMap.set(hash, relativePath);
+        let paths = nextHashMap.get(hash);
+        if (!paths) {
+            paths = new Set();
+            nextHashMap.set(hash, paths);
         }
+        paths.add(relativePath);
     }
     imageHashIndex = nextHashMap;
 }
@@ -176,15 +256,43 @@ function rebuildImageHashIndexFromPathMap() {
 function setImageHashIndexEntry(relativePath, hash) {
     const normalizedPath = normalizeRelativeImagePath(relativePath);
     if (!normalizedPath || !hash) return;
-    imagePathHashIndex.set(normalizedPath, hash.toLowerCase());
-    rebuildImageHashIndexFromPathMap();
+    const normalizedHash = String(hash).toLowerCase();
+    const previousHash = imagePathHashIndex.get(normalizedPath);
+    if (previousHash === normalizedHash) return;
+
+    if (previousHash) {
+        const previousPaths = imageHashIndex.get(previousHash);
+        if (previousPaths) {
+            previousPaths.delete(normalizedPath);
+            if (previousPaths.size === 0) {
+                imageHashIndex.delete(previousHash);
+            }
+        }
+    }
+
+    imagePathHashIndex.set(normalizedPath, normalizedHash);
+
+    let nextPaths = imageHashIndex.get(normalizedHash);
+    if (!nextPaths) {
+        nextPaths = new Set();
+        imageHashIndex.set(normalizedHash, nextPaths);
+    }
+    nextPaths.add(normalizedPath);
 }
 
 function removeImageHashIndexEntryByRelativePath(relativePath) {
     const normalizedPath = normalizeRelativeImagePath(relativePath);
     if (!normalizedPath) return;
-    if (imagePathHashIndex.delete(normalizedPath)) {
-        rebuildImageHashIndexFromPathMap();
+    const existingHash = imagePathHashIndex.get(normalizedPath);
+    if (!existingHash) return;
+
+    imagePathHashIndex.delete(normalizedPath);
+    const existingPaths = imageHashIndex.get(existingHash);
+    if (existingPaths) {
+        existingPaths.delete(normalizedPath);
+        if (existingPaths.size === 0) {
+            imageHashIndex.delete(existingHash);
+        }
     }
 }
 
@@ -356,18 +464,27 @@ async function ensureImageHashIndex() {
 }
 
 async function findDuplicatePathByHash(hash) {
-    const duplicateRelativePath = imageHashIndex.get(hash);
-    if (!duplicateRelativePath) return '';
+    const duplicateRelativePaths = imageHashIndex.get(hash);
+    if (!duplicateRelativePaths || duplicateRelativePaths.size === 0) return '';
 
-    const duplicatePath = resolveRelativeImagePath(duplicateRelativePath);
-    if (duplicatePath && await fileExists(duplicatePath)) {
-        return duplicatePath;
+    const stalePaths = [];
+    for (const duplicateRelativePath of duplicateRelativePaths) {
+        const duplicatePath = resolveRelativeImagePath(duplicateRelativePath);
+        if (duplicatePath && await fileExists(duplicatePath)) {
+            return duplicatePath;
+        }
+        stalePaths.push(duplicateRelativePath);
     }
 
     // 索引有脏数据时懒清理
-    removeImageHashIndexEntryByRelativePath(duplicateRelativePath);
-    markImageHashIndexDirty();
-    schedulePersistImageHashIndex();
+    for (const stalePath of stalePaths) {
+        removeImageHashIndexEntryByRelativePath(stalePath);
+    }
+
+    if (stalePaths.length > 0) {
+        markImageHashIndexDirty();
+        schedulePersistImageHashIndex();
+    }
     return '';
 }
 
@@ -466,9 +583,81 @@ function createCooldownMiddleware(routeKey, cooldownMs) {
 }
 
 // 初始化图片列表
+function compareImageNames(a, b) {
+    return a.localeCompare(b, 'en');
+}
+
+function getImageListState(type) {
+    return type === 'h'
+        ? { list: horizontalImages, set: horizontalImageSet }
+        : { list: verticalImages, set: verticalImageSet };
+}
+
+function replaceImageList(type, filenames) {
+    const nextList = [...filenames].sort(compareImageNames);
+    if (type === 'h') {
+        horizontalImages = nextList;
+        horizontalImageSet = new Set(nextList);
+        return;
+    }
+    verticalImages = nextList;
+    verticalImageSet = new Set(nextList);
+}
+
+function findImageInsertIndex(list, filename) {
+    let low = 0;
+    let high = list.length;
+    while (low < high) {
+        const mid = Math.floor((low + high) / 2);
+        if (compareImageNames(list[mid], filename) < 0) low = mid + 1;
+        else high = mid;
+    }
+    return low;
+}
+
+function addImageToList(type, filename) {
+    const safeFilename = path.basename(String(filename || ''));
+    if (!safeFilename || !SUPPORTED_FORMAT_SET.has(path.extname(safeFilename).toLowerCase())) {
+        return false;
+    }
+
+    const state = getImageListState(type);
+    if (state.set.has(safeFilename)) {
+        return false;
+    }
+
+    const insertAt = findImageInsertIndex(state.list, safeFilename);
+    state.list.splice(insertAt, 0, safeFilename);
+    state.set.add(safeFilename);
+    return true;
+}
+
+function removeImageFromList(type, filename) {
+    const safeFilename = path.basename(String(filename || ''));
+    if (!safeFilename) return false;
+
+    const state = getImageListState(type);
+    if (!state.set.has(safeFilename)) {
+        return false;
+    }
+
+    state.set.delete(safeFilename);
+    const expectedIndex = findImageInsertIndex(state.list, safeFilename);
+    if (state.list[expectedIndex] === safeFilename) {
+        state.list.splice(expectedIndex, 1);
+        return true;
+    }
+
+    const fallbackIndex = state.list.indexOf(safeFilename);
+    if (fallbackIndex !== -1) {
+        state.list.splice(fallbackIndex, 1);
+    }
+    return true;
+}
+
 function initImageLists() {
-    horizontalImages = scanImageDirectory(H_PATH);
-    verticalImages = scanImageDirectory(V_PATH);
+    replaceImageList('h', scanImageDirectory(H_PATH));
+    replaceImageList('v', scanImageDirectory(V_PATH));
 
     console.log(`📁 横屏图片: ${horizontalImages.length} 张 | 竖屏图片: ${verticalImages.length} 张`);
 }
@@ -556,6 +745,9 @@ async function classifyImage(filename, options = {}) {
             setImageHashIndexEntry(relativePath, outputHash);
             schedulePersistImageHashIndex();
         }
+        if (refreshList) {
+            addImageToList(isHorizontal ? 'h' : 'v', path.basename(finalPath));
+        }
 
         // 删除原文件
         try {
@@ -570,10 +762,6 @@ async function classifyImage(filename, options = {}) {
         console.log(`✅ 已分类: ${safeFilename} → ${type} (${width}x${height}) | ${originalSize}KB → ${newSize}KB WebP (q${usedQuality})`);
 
         // 刷新图片列表
-        if (refreshList) {
-            initImageLists();
-        }
-
         return 'classified';
     } catch (error) {
         console.error(`❌ 分类失败 ${safeFilename}:`, error.message);
@@ -606,7 +794,7 @@ async function classifyFilesBatch(files, options = {}) {
             cursor += 1;
             if (idx >= fileList.length) break;
 
-            const result = await classifyImage(fileList[idx], { refreshList: false });
+            const result = await classifyImage(fileList[idx], { refreshList });
             if (result === 'classified') stats.classified += 1;
             else if (result === 'duplicate') stats.duplicated += 1;
             else if (result === 'skipped') stats.skipped += 1;
@@ -615,10 +803,6 @@ async function classifyFilesBatch(files, options = {}) {
     });
 
     await Promise.all(workers);
-
-    if (refreshList && stats.classified > 0) {
-        initImageLists();
-    }
 
     return stats;
 }
@@ -638,6 +822,8 @@ async function processInbox() {
 // 监听目录变化
 function watchDirectories() {
     const inboxTimers = new Map();
+    const imageTimers = new Map();
+    let fullRefreshTimer = null;
 
     // 监听 inbox 目录 - 自动分类
     if (fs.existsSync(INBOX_PATH)) {
@@ -664,22 +850,53 @@ function watchDirectories() {
     }
 
     // 监听 h 和 v 目录 - 刷新列表
-    let debounceTimer = null;
-    const debounceRefresh = () => {
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
+    const scheduleFullRefresh = () => {
+        if (fullRefreshTimer) clearTimeout(fullRefreshTimer);
+        fullRefreshTimer = setTimeout(() => {
+            fullRefreshTimer = null;
             markImageHashIndexDirty();
             initImageLists();
-        }, 1000);
+        }, 500);
+        fullRefreshTimer.unref?.();
     };
 
-    [H_PATH, V_PATH].forEach(dir => {
+    const scheduleImageSync = (type, filename) => {
+        const name = typeof filename === 'string' ? filename : filename ? filename.toString() : '';
+        if (!name) {
+            scheduleFullRefresh();
+            return;
+        }
+        if (!SUPPORTED_FORMAT_SET.has(path.extname(name).toLowerCase())) return;
+
+        const timerKey = `${type}:${name}`;
+        if (imageTimers.has(timerKey)) {
+            clearTimeout(imageTimers.get(timerKey));
+        }
+
+        const timer = setTimeout(async () => {
+            imageTimers.delete(timerKey);
+            const imageDir = type === 'h' ? H_PATH : V_PATH;
+            const filePath = path.join(imageDir, name);
+            try {
+                if (await fileExists(filePath)) {
+                    addImageToList(type, name);
+                } else {
+                    removeImageFromList(type, name);
+                }
+                markImageHashIndexDirty();
+            } catch (error) {
+                console.error(`鉂?鍚屾鍥剧墖鍒楄〃澶辫触 ${name}:`, error.message);
+                scheduleFullRefresh();
+            }
+        }, 250);
+        timer.unref?.();
+        imageTimers.set(timerKey, timer);
+    };
+
+    [['h', H_PATH], ['v', V_PATH]].forEach(([type, dir]) => {
         if (fs.existsSync(dir)) {
             fs.watch(dir, (eventType, filename) => {
-                const name = typeof filename === 'string' ? filename : filename ? filename.toString() : '';
-                if (name && SUPPORTED_FORMAT_SET.has(path.extname(name).toLowerCase())) {
-                    debounceRefresh();
-                }
+                scheduleImageSync(type, filename);
             });
         }
     });
@@ -716,9 +933,8 @@ function getRandomImageInfo(imageList, type) {
 
 // 静态文件服务
 app.use('/ri', express.static(RI_PATH, {
-    maxAge: '30d',
-    etag: true,
-    immutable: true
+    maxAge: '7d',
+    etag: true
 }));
 
 // 缩略图服务 (动态生成并缓存)
@@ -755,7 +971,7 @@ app.get('/thumb', async (req, res) => {
         }
 
         res.set('Content-Type', 'image/webp');
-        res.set('Cache-Control', 'public, max-age=2592000, immutable');
+        res.set('Cache-Control', 'public, max-age=604800');
         res.sendFile(resolved.thumbPath);
 
     } catch (e) {
@@ -765,17 +981,16 @@ app.get('/thumb', async (req, res) => {
 });
 
 // 手动刷新
-app.get('/refresh', createCooldownMiddleware('refresh', 1000), (req, res) => {
-    markImageHashIndexDirty();
-    initImageLists();
-    res.json({ success: true, horizontal: horizontalImages.length, vertical: verticalImages.length });
+app.get('/refresh', (req, res) => {
+    res.set('Allow', 'POST');
+    res.status(405).json({ success: false, message: 'Use POST /api/refresh with admin auth' });
 });
 
 // 手动触发分类
-app.get('/classify', createCooldownMiddleware('classify', 1000), async (req, res) => {
-    const before = { h: horizontalImages.length, v: verticalImages.length };
-    const result = await processInbox();
-    const after = { h: horizontalImages.length, v: verticalImages.length };
+app.get('/classify', (req, res) => {
+    res.set('Allow', 'POST');
+    res.status(405).json({ success: false, message: 'Use POST /api/classify with admin auth' });
+    /*
 
     res.json({
         success: true,
@@ -786,9 +1001,58 @@ app.get('/classify', createCooldownMiddleware('classify', 1000), async (req, res
         skipped: result.skipped,
         failed: result.failed
     });
+    */
 });
 
 // 图片列表 API (画廊页面使用，支持分页)
+app.get('/api/admin/session', (req, res) => {
+    res.json({ success: true, authenticated: hasValidAdminSession(req) });
+});
+
+app.post('/api/admin/session', (req, res) => {
+    if (!ADMIN_PASSWORD) {
+        return res.status(403).json({ success: false, message: '服务端未配置管理密码' });
+    }
+
+    const password = String(req.body?.password || '').trim();
+    if (!password || password !== ADMIN_PASSWORD) {
+        clearAdminSessionCookie(res);
+        return res.status(403).json({ success: false, message: '密码错误或未提供' });
+    }
+
+    const { token, expiresAt } = createAdminSession();
+    setAdminSessionCookie(res, token, expiresAt);
+    res.json({ success: true, expiresAt });
+});
+
+app.delete('/api/admin/session', (req, res) => {
+    destroyAdminSession(req);
+    clearAdminSessionCookie(res);
+    res.json({ success: true });
+});
+
+app.post('/api/refresh', requireAuth, createCooldownMiddleware('refresh', 1000), (req, res) => {
+    markImageHashIndexDirty();
+    initImageLists();
+    res.json({ success: true, horizontal: horizontalImages.length, vertical: verticalImages.length });
+});
+
+app.post('/api/classify', requireAuth, createCooldownMiddleware('classify', 1000), async (req, res) => {
+    const before = { h: horizontalImages.length, v: verticalImages.length };
+    const result = await processInbox();
+    const after = { h: horizontalImages.length, v: verticalImages.length };
+
+    res.json({
+        success: true,
+        message: '鍒嗙被瀹屾垚',
+        added: { horizontal: after.h - before.h, vertical: after.v - before.v },
+        processed: result.total,
+        duplicated: result.duplicated,
+        skipped: result.skipped,
+        failed: result.failed
+    });
+});
+
 app.get('/api/images', (req, res) => {
     const type = req.query.type === 'h' || req.query.type === 'v' ? req.query.type : 'all';
     const page = parseBoundedInt(req.query.page, 1, 1, 1000000);
@@ -948,7 +1212,7 @@ app.delete('/api/delete', requireAuth, express.json(), async (req, res) => {
         });
 
         // 刷新图片列表
-        initImageLists();
+        removeImageFromList(resolved.type, path.basename(resolved.relativeName));
 
         console.log(`🗑️ 已删除: ${url}`);
         res.json({ success: true, message: '图片已删除' });

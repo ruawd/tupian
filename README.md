@@ -119,3 +119,10 @@ git pull
 ## 📄 License
 
 GPL-3.0
+
+## Admin Notes
+
+- Set `ADMIN_PASSWORD` before using upload, delete, refresh, or classify actions.
+- Admin login now uses `POST /api/admin/session` and a server-side session cookie.
+- `POST /api/refresh` refreshes image cache and list state.
+- `POST /api/classify` processes files in `ri/inbox`.

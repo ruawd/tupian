@@ -95,12 +95,22 @@
             text-decoration: none;
             color: inherit;
             transition: 0.2s;
-            font-size: 0.85rem
+            font-size: 0.85rem;
+            border: none;
+            width: 100%;
+            text-align: left;
+            cursor: pointer;
+            font: inherit
         }
 
         .api-item:hover {
             background: rgba(255, 255, 255, 0.15);
             transform: translateX(3px)
+        }
+
+        .api-list a[href="/refresh"],
+        .api-list a[href="/classify"] {
+            display: none
         }
 
         .api-code {
@@ -220,6 +230,12 @@
             <div class="card">
                 <h2>📡 图片接口</h2>
                 <div class="api-list">
+                    <button type="button" class="api-item" id="session-btn"><span class="api-code">session</span><span
+                            class="api-desc">Admin Login</span></button>
+                    <button type="button" class="api-item" id="refresh-btn"><span class="api-code">POST /api/refresh</span><span
+                            class="api-desc">Refresh image cache</span></button>
+                    <button type="button" class="api-item" id="classify-btn"><span class="api-code">POST /api/classify</span><span
+                            class="api-desc">Process inbox images</span></button>
                     <a href="/pic?img=h" class="api-item"><span class="api-code">/pic?img=h</span><span
                             class="api-desc">横屏随机图片</span></a>
                     <a href="/pic?img=v" class="api-item"><span class="api-code">/pic?img=v</span><span
@@ -272,7 +288,108 @@
         </div>
     </div>
     <script>
-        fetch('/api/images?type=all&page=1&pageSize=1').then(r => r.json()).then(d => { document.getElementById('h-count').textContent = d.horizontal; document.getElementById('v-count').textContent = d.vertical; document.getElementById('total-count').textContent = d.horizontal + d.vertical }).catch(() => { });
+        const sessionBtn = document.getElementById('session-btn');
+        const refreshBtn = document.getElementById('refresh-btn');
+        const classifyBtn = document.getElementById('classify-btn');
+        let adminSessionActive = false;
+
+        function updateSessionButton() {
+            sessionBtn.querySelector('.api-desc').textContent = adminSessionActive ? 'Admin Logout' : 'Admin Login';
+        }
+
+        async function loadStats() {
+            try {
+                const res = await fetch('/api/images?type=all&page=1&pageSize=1', { cache: 'no-store' });
+                const data = await res.json();
+                document.getElementById('h-count').textContent = data.horizontal;
+                document.getElementById('v-count').textContent = data.vertical;
+                document.getElementById('total-count').textContent = data.horizontal + data.vertical;
+            } catch {
+            }
+        }
+
+        async function refreshAdminSession() {
+            try {
+                const res = await fetch('/api/admin/session', { cache: 'no-store' });
+                const data = await res.json();
+                adminSessionActive = Boolean(data && data.authenticated);
+            } catch {
+                adminSessionActive = false;
+            }
+            updateSessionButton();
+        }
+
+        async function loginAdminSession() {
+            const password = (prompt('Enter admin password for this browser session') || '').trim();
+            if (!password) return false;
+
+            const res = await fetch('/api/admin/session', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.success) {
+                adminSessionActive = false;
+                updateSessionButton();
+                alert(data.message || 'Login failed');
+                return false;
+            }
+
+            adminSessionActive = true;
+            updateSessionButton();
+            return true;
+        }
+
+        async function logoutAdminSession() {
+            try {
+                await fetch('/api/admin/session', { method: 'DELETE' });
+            } catch {
+            }
+            adminSessionActive = false;
+            updateSessionButton();
+        }
+
+        async function ensureAdminSession() {
+            if (adminSessionActive) return true;
+            return loginAdminSession();
+        }
+
+        async function runManageAction(path) {
+            const hasAdminSession = await ensureAdminSession();
+            if (!hasAdminSession) return;
+
+            const res = await fetch(path, { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.success) {
+                if (res.status === 403) {
+                    adminSessionActive = false;
+                    updateSessionButton();
+                }
+                alert(data.message || 'Request failed');
+                return;
+            }
+
+            await loadStats();
+            if (path === '/api/refresh') {
+                alert(`Refresh complete. H ${data.horizontal}, V ${data.vertical}`);
+                return;
+            }
+            alert(`Classify complete. Processed ${data.processed || 0}, skipped ${data.skipped || 0}, failed ${data.failed || 0}`);
+        }
+
+        sessionBtn.onclick = async () => {
+            if (adminSessionActive) {
+                await logoutAdminSession();
+                return;
+            }
+            await loginAdminSession();
+        };
+
+        refreshBtn.onclick = () => runManageAction('/api/refresh');
+        classifyBtn.onclick = () => runManageAction('/api/classify');
+        loadStats();
+        refreshAdminSession();
         document.getElementById('formats').innerHTML = ['.webp', '.avif', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg'].map(f => `<span class="format-tag">${f}</span>`).join('');
     </script>
 </body>

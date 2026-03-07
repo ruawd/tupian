@@ -918,19 +918,75 @@
 
         const getFavs = () => Array.from(getFavsSet());
         const isFav = url => getFavsSet().has(url);
-        const getAdminPassword = () => localStorage.getItem('galleryAdminPassword') || '';
-        const setAdminPassword = value => localStorage.setItem('galleryAdminPassword', value);
-        const clearAdminPassword = () => localStorage.removeItem('galleryAdminPassword');
+        const passwordBtn = document.getElementById('passwordBtn');
+        let adminSessionActive = false;
 
-        function ensureAdminPassword() {
-            let pwd = getAdminPassword();
-            if (!pwd) {
+        function updateAdminButton() {
+            passwordBtn.textContent = adminSessionActive ? 'Admin Logout' : 'Admin Login';
+        }
+
+        async function refreshAdminSession() {
+            try {
+                const res = await fetch('/api/admin/session', { cache: 'no-store' });
+                const data = await res.json();
+                adminSessionActive = Boolean(data && data.authenticated);
+            } catch {
+                adminSessionActive = false;
+            }
+            updateAdminButton();
+        }
+
+        async function loginAdminSession(promptText = 'Enter admin password for uploads, deletes, and admin actions') {
+            const password = (prompt(promptText) || '').trim();
+            if (!password) return false;
+
+            try {
+                const res = await fetch('/api/admin/session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok || !data.success) {
+                    adminSessionActive = false;
+                    updateAdminButton();
+                    msg('Login failed: ' + (data.message || 'request rejected'));
+                    return false;
+                }
+
+                adminSessionActive = true;
+                updateAdminButton();
+                msg('Admin session active');
+                return true;
+            } catch {
+                adminSessionActive = false;
+                updateAdminButton();
+                msg('Login failed');
+                return false;
+            }
+        }
+
+        async function logoutAdminSession(showMessage = true) {
+            try {
+                await fetch('/api/admin/session', { method: 'DELETE' });
+            } catch {
+            }
+            adminSessionActive = false;
+            updateAdminButton();
+            if (showMessage) {
+                msg('Admin session cleared');
+            }
+        }
+
+        async function ensureAdminPassword() {
+            if (adminSessionActive) return true;
+            return loginAdminSession(); /*
                 pwd = prompt('请输入管理密码（用于上传和删除）') || '';
                 pwd = pwd.trim();
                 if (!pwd) return '';
                 setAdminPassword(pwd);
             }
-            return pwd;
+            */
         }
 
         // 提示消息
@@ -938,8 +994,9 @@
 
         refreshBtn.onclick = () => location.reload();
 
-        document.getElementById('passwordBtn').onclick = () => {
-            const current = getAdminPassword();
+        passwordBtn.onclick = async () => {
+            if (adminSessionActive) { await logoutAdminSession(); return; }
+            await loginAdminSession('Enter admin password for this browser session'); /*
             const value = prompt('请输入管理密码（留空清除）', current) ?? '';
             const trimmed = value.trim();
             if (!trimmed) {
@@ -949,6 +1006,7 @@
             }
             setAdminPassword(trimmed);
             msg('✅ 管理密码已保存');
+            */
         };
 
         // 加载图片列表（分页）
@@ -1090,6 +1148,10 @@
                     favs.add(url);
                     fb.classList.add('active');
                 } else {
+                    if (res.status === 403) {
+                        adminSessionActive = false;
+                        updateAdminButton();
+                    }
                     favs.delete(url);
                     fb.classList.remove('active');
                     if (currentCat === 'favorites') {
@@ -1184,8 +1246,8 @@
             deleteConfirm.classList.remove('active');
             msg('⏳ 正在删除...');
 
-            const password = ensureAdminPassword();
-            if (!password) {
+            const hasAdminSession = await ensureAdminPassword();
+            if (!hasAdminSession) {
                 msg('❌ 未提供管理密码');
                 return;
             }
@@ -1194,8 +1256,7 @@
                 const res = await fetch('/api/delete', {
                     method: 'DELETE',
                     headers: {
-                        'Content-Type': 'application/json',
-                        'x-admin-password': password
+                        'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({ url: currentUrl })
                 });
@@ -1216,6 +1277,10 @@
                     if (currentCat === 'favorites') {
                         renderImages();
                     } else {
+                        if (xhr.status === 403) {
+                            adminSessionActive = false;
+                            updateAdminButton();
+                        }
                         loadImages(currentPage);
                     }
                 } else {
@@ -1316,8 +1381,8 @@
 
         uploadSubmit.onclick = async () => {
             if (filesToUpload.length === 0) return;
-            const password = ensureAdminPassword();
-            if (!password) {
+            const hasAdminSession = await ensureAdminPassword();
+            if (!hasAdminSession) {
                 msg('❌ 未提供管理密码');
                 return;
             }
@@ -1350,7 +1415,6 @@
                 };
                 xhr.onerror = () => { msg('❌ 网络错误'); uploadSubmit.disabled = false; };
                 xhr.open('POST', '/api/upload');
-                xhr.setRequestHeader('x-admin-password', password);
                 xhr.send(formData);
             } catch (e) {
                 msg('❌ 上传失败');
@@ -1360,6 +1424,8 @@
 
         // 初始化
         updateFavCount();
+        updateAdminButton();
+        refreshAdminSession();
         loadImages();
     </script>
 </body>
