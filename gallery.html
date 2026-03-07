@@ -1019,6 +1019,9 @@
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
                 if (requestId !== loadRequestId) return;
+                if (data.totalPages > 0 && page > data.totalPages) {
+                    return loadImages(data.totalPages);
+                }
 
                 allImages = data.images;
                 currentPage = data.page;
@@ -1148,10 +1151,6 @@
                     favs.add(url);
                     fb.classList.add('active');
                 } else {
-                    if (res.status === 403) {
-                        adminSessionActive = false;
-                        updateAdminButton();
-                    }
                     favs.delete(url);
                     fb.classList.remove('active');
                     if (currentCat === 'favorites') {
@@ -1253,35 +1252,39 @@
             }
 
             try {
+                const deletedUrl = currentUrl;
                 const res = await fetch('/api/delete', {
                     method: 'DELETE',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({ url: currentUrl })
+                    body: JSON.stringify({ url: deletedUrl })
                 });
-                const data = await res.json();
+                const data = await res.json().catch(() => ({}));
+                if (res.status === 403) {
+                    adminSessionActive = false;
+                    updateAdminButton();
+                }
 
-                if (data.success) {
+                if (res.ok && data.success) {
                     msg('✅ 图片已删除');
                     hideLb();
 
                     // 从收藏中移除
                     const favs = getFavsSet();
-                    if (favs.delete(currentUrl)) {
+                    if (favs.delete(deletedUrl)) {
                         persistFavs();
                         updateFavCount();
                     }
+
+                    allImages = allImages.filter(img => img.url !== deletedUrl);
 
                     // 刷新当前页面
                     if (currentCat === 'favorites') {
                         renderImages();
                     } else {
-                        if (xhr.status === 403) {
-                            adminSessionActive = false;
-                            updateAdminButton();
-                        }
-                        loadImages(currentPage);
+                        renderImages();
+                        await loadImages(currentPage);
                     }
                 } else {
                     msg('❌ ' + data.message);
