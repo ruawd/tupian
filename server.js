@@ -198,6 +198,43 @@ function parseBoundedInt(value, fallback, min, max) {
     return Math.min(max, Math.max(min, parsed));
 }
 
+// 解析模糊百分比参数（0-100），返回 sharp 高斯模糊 sigma 值
+// blur=0 或未提供 → 0（不模糊）
+// blur=100 → 30（最大模糊）
+function parseBlurSigma(blurParam) {
+    if (blurParam === undefined || blurParam === null || blurParam === '') return 0;
+    const percent = Number.parseFloat(blurParam);
+    if (!Number.isFinite(percent) || percent <= 0) return 0;
+    const clamped = Math.min(100, Math.max(0, percent));
+    // 最小有效 sigma 为 0.3（sharp 要求），最大映射到 30
+    const sigma = (clamped / 100) * 30;
+    return sigma < 0.3 ? 0 : sigma;
+}
+
+// 对图片文件应用高斯模糊并返回 buffer
+async function applyBlurToFile(filePath, sigma) {
+    return sharp(filePath)
+        .blur(sigma)
+        .toBuffer();
+}
+
+// 根据扩展名获取 Content-Type
+function imageContentType(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    const types = {
+        '.webp': 'image/webp',
+        '.avif': 'image/avif',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.bmp': 'image/bmp',
+        '.ico': 'image/x-icon',
+        '.svg': 'image/svg+xml'
+    };
+    return types[ext] || 'application/octet-stream';
+}
+
 const CLASSIFY_CONCURRENCY = parseBoundedInt(process.env.CLASSIFY_CONCURRENCY, 3, 1, 8);
 const ADMIN_SESSION_TTL_MS = parseBoundedInt(process.env.ADMIN_SESSION_TTL_HOURS, 12, 1, 24 * 30) * 60 * 60 * 1000;
 
@@ -931,8 +968,26 @@ function getRandomImageInfo(imageList, type) {
     };
 }
 
-// 静态文件服务
-app.use('/ri', express.static(RI_PATH, {
+// 静态文件服务（支持 ?blur=N 模糊参数）
+app.use('/ri', async (req, res, next) => {
+    const sigma = parseBlurSigma(req.query.blur);
+    if (!sigma) return next(); // 无模糊参数，走默认静态服务
+
+    // 仅处理图片目录下的 h/v 文件
+    const resolved = resolveImagePathFromUrlPath(req.path.startsWith('/ri') ? req.path : `/ri${req.path}`);
+    if (!resolved) return next();
+
+    try {
+        if (!(await fileExists(resolved.filePath))) return next();
+        const buffer = await applyBlurToFile(resolved.filePath, sigma);
+        res.set('Content-Type', imageContentType(resolved.filePath));
+        res.set('Cache-Control', 'public, max-age=86400'); // 模糊图片缓存 1 天
+        res.send(buffer);
+    } catch (err) {
+        console.error('❌ 模糊处理失败:', err.message);
+        next(); // 出错时降级到原图
+    }
+}, express.static(RI_PATH, {
     maxAge: '7d',
     etag: true
 }));
@@ -1104,22 +1159,38 @@ app.get('/api/images', (req, res) => {
     });
 });
 
-// 随机图片 API
-app.get('/pic', (req, res) => {
+// 随机图片 API（支持 ?blur=N 模糊参数）
+app.get('/pic', async (req, res) => {
     try {
         const imgType = req.query.img;
+        const blurSigma = parseBlurSigma(req.query.blur);
         res.set('Access-Control-Allow-Origin', '*');
         const useRedirect = req.query.redirect === '1';
 
-        const sendRandomImage = (type, list, missingMessage) => {
+        const sendRandomImage = async (type, list, missingMessage) => {
             const info = getRandomImageInfo(list, type);
             if (!info) {
                 return res.status(404).send(missingMessage);
             }
             res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+
+            // 重定向模式下，把 blur 参数传递到目标 URL
             if (useRedirect) {
-                return res.redirect(302, info.url);
+                const redirectUrl = blurSigma ? `${info.url}?blur=${req.query.blur}` : info.url;
+                return res.redirect(302, redirectUrl);
             }
+
+            // 需要模糊时，通过 sharp 动态处理
+            if (blurSigma) {
+                try {
+                    const buffer = await applyBlurToFile(info.filePath, blurSigma);
+                    res.set('Content-Type', imageContentType(info.filePath));
+                    return res.send(buffer);
+                } catch (err) {
+                    console.error('❌ 模糊处理失败，返回原图:', err.message);
+                }
+            }
+
             return res.sendFile(info.filePath);
         };
 

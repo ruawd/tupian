@@ -242,6 +242,8 @@
                             class="api-desc">竖屏随机图片</span></a>
                     <a href="/pic?img=ua" class="api-item"><span class="api-code">/pic?img=ua</span><span
                             class="api-desc">根据设备自动选择</span></a>
+                    <a href="/pic?img=h&blur=50" class="api-item"><span class="api-code">/pic?img=h&blur=50</span><span
+                            class="api-desc">横屏随机 + 50% 模糊</span></a>
                 </div>
             </div>
             <div class="card">
@@ -277,6 +279,23 @@
                 </div>
                 <div class="tip-box">💡 把图片放到 <code>ri/inbox</code> 目录会自动分类</div>
             </div>
+            <div class="card">
+                <h2>🌫️ 模糊参数</h2>
+                <div class="api-list">
+                    <div class="api-item" style="cursor:default">
+                        <span class="api-code">?blur=N</span>
+                        <span class="api-desc">N 为 0-100 的模糊百分比</span>
+                    </div>
+                </div>
+                <div class="tip-box">
+                    💡 在任意图片 URL 后追加 <code>?blur=50</code> 即可获得 50% 模糊效果<br>
+                    示例：<code>/pic?img=h&blur=30</code> 或 <code>/ri/h/xxx.webp?blur=80</code><br>
+                    <code>blur=0</code> 或不传则返回原图，<code>blur=100</code> 为最大模糊
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
             <div class="card">
                 <h2>📋 支持格式</h2>
                 <div class="formats" id="formats"></div>
